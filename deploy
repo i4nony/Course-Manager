@@ -1,0 +1,128 @@
+#!/bin/bash
+
+set -o errexit
+set -o nounset
+
+. /etc/wumii-functions
+
+PORT_PROPERTY=server.port
+SERVICE_NAME_PROPERTY=spring.application.name
+
+function get_property() {
+    propertyName=`echo $1 | sed -e "s/\./\\\./g"`
+    fileName=$2;
+    cat $fileName | sed -n -e "s/^$propertyName=//p" | tail -1
+}
+
+function update_config() {
+    local CONFIG=$1
+    if ! diff "$CONFIG" "/lib/systemd/system/$CONFIG"; then
+        sudo cp -i "$CONFIG" "/lib/systemd/system/$CONFIG"
+    fi
+}
+
+function is_set() {
+    [ "${!1:+1}" == 1 ]
+}
+
+if is_set SUDO_USER; then
+    echo "You don't need to use sudo to run this script"
+    exit
+fi
+
+# execute a dummy command to record password early
+sudo echo -n
+
+function write_config() {
+    local PROFILE=$1
+    echo "[Unit]
+Description=$SERVICE_NAME
+
+[Service]
+User=wumii
+Group=twowoods
+ExecStart=/bin/sh -ec \"/usr/bin/java -Xmx3G -Xloggc:/var/log/wumii/$SERVICE_NAME/gc.log.\$\$(date +%%Y-%%m-%%d_%%H-%%M-%%S) -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:-OmitStackTraceInFastThrow -Djava.net.preferIPv4Stack=true -XX:+UnlockCommercialFeatures -XX:+FlightRecorder -XX:FlightRecorderOptions=defaultrecording=true,disk=true,maxage=2h -Dspring.profiles.active=$PROFILE -jar /var/lib/wumii/services/$SERVICE_NAME/$SERVICE_NAME.jar\"
+
+[Install]
+WantedBy=multi-user.target" > $SERVICE_NAME.service
+
+}
+
+function check_dir() {
+    local DIR=$1
+    if [ -d "$DIR" ]; then
+        local OWNER=$(stat -c %U "$DIR")
+        if [ "$OWNER" != wumii ]; then
+            echo "Fixing permission of $DIR"
+            sudo chown -R wumii:twowoods $DIR
+        fi
+    else
+        echo "Creating $DIR"
+        sudo mkdir -p $DIR && sudo chown wumii:twowoods $DIR
+    fi
+}
+
+function bootstrap() {
+    check_dir "$DEST_DIR"
+    check_dir "/var/log/wumii/$SERVICE_NAME"
+
+    write_config $PROFILE
+
+    UNIT_FILE="$SERVICE_NAME.service"
+    if [ ! -e "$UNIT_FILE" ]; then
+        echo "Installing $UNIT_FILE"
+        sudo cp "$UNIT_FILE" /lib/systemd/system/
+        sudo systemctl daemon-reload
+        sudo systemctl enable $SERVICE_NAME.service
+    else
+        update_config "$UNIT_FILE"
+        sudo systemctl daemon-reload
+    fi
+
+    rm "$SERVICE_NAME.service"
+}
+
+
+if [[ "$HOSTNAME" =~ ^web- ]]; then
+    PROFILE=prod
+elif [[ "$HOSTNAME" =~ ^dev ]] || [[ "$HOSTNAME" =~ ^office- ]] || [[ "$HOSTNAME" =~ ^test-ha- ]]; then
+    PROFILE=beta
+else
+    PROFILE=alpha
+fi
+
+if [ $# -eq 2 ]; then
+    SRC_BIN=$1
+    echo "Using $SRC_BIN"
+    PROPERTIES_FILE=$2
+else
+    SRC_BIN="wechat-operation-web/target/wechat-operation-web-1.0-SNAPSHOT.jar"
+
+    echo "Writing Mercurial manifest..."
+    VERSION_FILE=wechat-operation-web/src/main/resources/version.txt
+    hg parents --template '{node}\n\n' > "$VERSION_FILE"
+    mvn -U -Dmaven.test.skip=true clean package
+    rm "$VERSION_FILE"
+    PROPERTIES_FILE=wechat-operation-web/src/main/resources/application.properties
+fi
+
+SERVICE_NAME=`get_property $SERVICE_NAME_PROPERTY $PROPERTIES_FILE`
+SERVICE_PORT=`get_property $PORT_PROPERTY $PROPERTIES_FILE`
+DEST_DIR="/var/lib/wumii/services/$SERVICE_NAME"
+
+bootstrap
+
+echo
+echo "Stoping $SERVICE_NAME"
+sudo systemctl stop $SERVICE_NAME
+
+echo "Copying $SRC_BIN to $DEST_DIR"
+sudo -u wumii rm -rf $DEST_DIR/$SERVICE_NAME
+sudo -u wumii cp $SRC_BIN $DEST_DIR/$SERVICE_NAME.jar
+
+echo "Starting $SERVICE_NAME"
+sudo systemctl start $SERVICE_NAME
+
+echo "Deployment complete"
+echo
+

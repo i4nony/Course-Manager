@@ -1,0 +1,246 @@
+package com.wumii.wechat.service;
+
+import com.google.common.base.Objects;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+import com.google.protobuf.ByteString;
+import com.wumii.application.util.DateTimeUtils;
+import com.wumii.application.util.JsonUtils;
+import com.wumii.wechat.dao.FriendDao;
+import com.wumii.wechat.dao.WechatUserDao;
+import com.wumii.wechat.domain.NewFriendMessage;
+import com.wumii.wechat.dto.Dto;
+import com.wumii.wechat.entity.Friend;
+import com.wumii.wechat.entity.WeChatUser;
+import com.wumii.wechat.util.Constant;
+import org.dom4j.Document;
+import org.dom4j.DocumentException;
+import org.dom4j.DocumentHelper;
+import org.dom4j.Element;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+public class WeChatFriendService {
+
+    private static final Logger logger = LoggerFactory.getLogger(WeChatFriendService.class);
+
+    private final FriendDao friendDao;
+    private final WechatUserDao wechatUserDao;
+    private final TransactionTemplate transactionTemplate;
+    private final RabbitTemplate rabbitTemplate;
+    private final WeChatLoginService weChatLoginService;
+
+    @Autowired
+    public WeChatFriendService(FriendDao friendDao,
+                               WechatUserDao wechatUserDao,
+                               TransactionTemplate transactionTemplate,
+                               RabbitTemplate rabbitTemplate,
+                               WeChatLoginService weChatLoginService) {
+        this.friendDao = friendDao;
+        this.wechatUserDao = wechatUserDao;
+        this.transactionTemplate = transactionTemplate;
+        this.rabbitTemplate = rabbitTemplate;
+        this.weChatLoginService = weChatLoginService;
+    }
+
+    void acceptNewFriend(WeChatClient client, Dto.CommonMessage commonMessage) {
+        Preconditions.checkState(client.inEventLoop());
+        Preconditions.checkArgument(Objects.equal(commonMessage.getFrom().getId(), "fmessage"));
+
+        String content = commonMessage.getRaw().getContent();
+        try {
+            Document document = DocumentHelper.parseText(content);
+            Element rootElement = document.getRootElement();
+            String fromWxid = rootElement.attributeValue("fromusername");
+            String encryptUserName = rootElement.attributeValue("encryptusername");
+            String ticket = rootElement.attributeValue("ticket");
+            client.submit(() -> verifyFriend(client, fromWxid, encryptUserName, ticket));
+        } catch (DocumentException e) {
+            logger.error("parse xml error", e);
+        }
+    }
+
+    private void verifyFriend(WeChatClient client, String fromWxid, String encryptUserName, String ticket) throws IOException {
+        Preconditions.checkState(client.inEventLoop());
+
+        Dto.VerifyFriendRequest request = buildVerifyFriendRequest(client, fromWxid, encryptUserName, ticket);
+        Dto.VerifyUserResponse verifyUserResponse = Dto.VerifyUserResponse.parseFrom(
+                client.sendRequest("/cgi-bin/micromsg-bin/verifyuser", request.toByteArray(),
+                30, false));
+        if (verifyUserResponse.getResult().getCode() != 0) {
+            logger.error("verify friend fail");
+            return;
+        }
+        rabbitTemplate.convertAndSend(Constant.EXCHANGE, "",
+                JsonUtils.serialize(new NewFriendMessage(client.getWxid(), fromWxid)));
+    }
+
+    private Dto.VerifyFriendRequest buildVerifyFriendRequest(WeChatClient client, String fromWxid,
+                                                             String encryptUserName, String ticket) {
+        return Dto.VerifyFriendRequest.newBuilder()
+                .setBaseRequest(Dto.BaseRequest.newBuilder()
+                        .setAesKey(ByteString.copyFrom(client.getSessionKey()))
+                        .setDeviceId(ByteString.copyFrom(client.getIpad().getDeviceId()))
+                        .setUin(client.getUin())
+                        .setOsVersion(Constant.OS_VERSION)
+                        .setClientVersion(Constant.CLIENT_VERSION)
+                        .setScene(0)
+                        .build())
+                .setOpCode(3)
+                .setUnknown3(1)
+                .setFriendInfo(Dto.VerifyFriendRequest.FriendInfo.newBuilder()
+                        .setEncryptUserName(encryptUserName)
+                        .setTicket(ticket)
+                        .setAntiTicket("")
+                        .setUnknown4(0)
+                        .setUnknown8(0)
+                        .build())
+                .setContent("") // TODO: 7/13/18 好友验证信息
+                .setUnknown6(1)
+                .setUnknown7(ByteString.copyFrom(new byte[]{0x06}))
+                .build();
+    }
+
+    void getContact(WeChatClient client) throws IOException {
+        Preconditions.checkState(client.inEventLoop());
+
+        boolean continueFlag;
+        int contactSeq = 0;
+        int chatRoomContactSeq = 0;
+        do {
+            Dto.InitContactRequest request = buildInitContactRequest(client, contactSeq, chatRoomContactSeq);
+            Dto.InitContactResponse response = Dto.InitContactResponse.parseFrom(
+                    client.sendRequest("/cgi-bin/micromsg-bin/initcontact", request.toByteArray(),
+                            851, false));
+            if (response.getResult().getCode() != 0) {
+                logger.error("get contact fail");
+                return;
+            }
+            continueFlag = response.getContinueFlag() == 1;
+            if (continueFlag) {
+                contactSeq = response.getContactSeq();
+                chatRoomContactSeq = response.getChatRoomContactSeq();
+            }
+            List<String> wxids = Lists.newArrayList(response.getWxidsList());
+            wxids.removeAll(Constant.SYSTEM_WXID);
+            wxids.removeIf(wxid -> wxid.startsWith("gh_"));
+            getContactInfo(client, wxids).forEach(contactInfo -> saveContactInfo(client, contactInfo));
+        } while (continueFlag);
+    }
+
+    private Dto.InitContactRequest buildInitContactRequest(WeChatClient client, int contactSeq, int chatRoomContactSeq) {
+        return Dto.InitContactRequest.newBuilder()
+                        .setWxid(client.getWxid())
+                        .setContactSeq(contactSeq)
+                        .setChatRoomContactSeq(chatRoomContactSeq)
+                        .build();
+    }
+
+    private List<Dto.ContactInfo> getContactInfo(WeChatClient client, List<String> wxids) throws IOException {
+        Preconditions.checkState(client.inEventLoop());
+
+        Dto.GetContactInfoRequest request = buildGetContactInfoRequest(wxids);
+        Dto.GetContactInfoResponse response = Dto.GetContactInfoResponse.parseFrom(
+                client.sendRequest("/cgi-bin/micromsg-bin/batchgetcontactbriefinfo", request.toByteArray(),
+                945, false));
+        if (response.getResult().getCode() != 0) {
+            logger.error("get contact info fail");
+            return Collections.emptyList();
+        }
+        return response.getContactInfoWrapList().stream()
+                .map(Dto.GetContactInfoResponse.ContactInfoWrap::getContactInfo)
+                .collect(Collectors.toList());
+    }
+
+    private Dto.GetContactInfoRequest buildGetContactInfoRequest(List<String> wxids) {
+        return Dto.GetContactInfoRequest.newBuilder()
+                    .addAllWxids(wxids)
+                    .build();
+    }
+
+    void saveContactInfo(WeChatClient client, Dto.ContactInfo contactInfo) {
+        Preconditions.checkState(client.inEventLoop());
+        String wxid = client.getWxid();
+        String friendWxid = contactInfo.getWxid().getId();
+        transactionTemplate.execute((status) -> {
+            wechatUserDao.lock(wxid);
+            if (friendWxid.startsWith("gh_") || Constant.SYSTEM_WXID.contains(friendWxid)) { //公众号或系统账号
+                return null;
+            }
+            if (friendWxid.endsWith("@chatroom")) { //群
+                // TODO: 7/5/18 群处理
+            } else {
+                Friend friend = friendDao.findByWxidAndFriendWxid(wxid, friendWxid);
+                if (friend == null) {
+                    friendDao.save(new Friend(wxid, friendWxid));
+                    friendDao.save(new Friend(friendWxid, wxid));
+                }
+                WeChatUser weChatUser = wechatUserDao.findOne(friendWxid);
+                if (weChatUser == null) {
+                    wechatUserDao.save(new WeChatUser(friendWxid, contactInfo.getAvatarBig(),
+                            contactInfo.getNickname().getName()));
+                } else {
+                    weChatUser.setAvatarUrlPath(contactInfo.getAvatarBig());
+                    weChatUser.setNickName(contactInfo.getNickname().getName());
+                    weChatUser.setUpdateTime(DateTimeUtils.now());
+                    wechatUserDao.save(weChatUser);
+                }
+            }
+            return null;
+        });
+    }
+
+    public void changeRemarkName(String wxid, String name) {
+        WeChatClient client = weChatLoginService.getLoginClient();
+        client.submit(() -> changeRemarkName(client, wxid, name));
+    }
+
+    void changeRemarkName(WeChatClient client, String wxid, String name) throws IOException {
+        Preconditions.checkState(client.inEventLoop());
+
+        List<Dto.ContactInfo> contactInfos = getContactInfo(client, Lists.newArrayList(wxid));
+        if (contactInfos.isEmpty()) {
+            logger.error("change remark name fail");
+            return;
+        }
+        Dto.ContactInfo contactInfo = contactInfos.get(1);
+        contactInfo = contactInfo.toBuilder()
+                .setRemarkName(Dto.ContactInfo.RemarkName.newBuilder()
+                        .setName(name)
+                .build()).build();
+        if (!sendOplogRequest(client, contactInfo.toByteArray(), 2)) {
+            logger.error("change remark name error");
+        }
+    }
+
+    boolean sendOplogRequest(WeChatClient client, byte[] data, int cmdId) throws IOException {
+        Preconditions.checkState(client.inEventLoop());
+
+        Dto.OplogRequest request = Dto.OplogRequest.newBuilder()
+                .setOplog(Dto.OplogRequest.Oplog.newBuilder()
+                        .setUnknown1(1)
+                        .setCmd(Dto.OplogRequest.Oplog.Command.newBuilder()
+                                .setBody(Dto.OplogRequest.Oplog.Command.Body.newBuilder()
+                                        .setLength(data.length)
+                                        .setData(ByteString.copyFrom(data))
+                                        .build())
+                                .setCmdId(cmdId)
+                                .build())
+                        .build())
+                .build();
+        Dto.OplogResponse response = Dto.OplogResponse.parseFrom(
+                client.sendRequest("/cgi-bin/micromsg-bin/oplog", request.toByteArray(),
+                681, false));
+        return response.getResult().getCode() == 0;
+    }
+}

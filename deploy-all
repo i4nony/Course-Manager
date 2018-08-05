@@ -1,0 +1,122 @@
+#!/opt/wumii/bin/onepass /bin/bash
+
+set -o errexit
+set -o nounset
+
+if [ $# -eq 1 ]; then
+    DESC=$1
+else
+    DESC=
+fi
+
+if hg status | egrep '^(!|\?)'; then
+    echo "Reject deployment since the working directory contains missing or untracked files"
+    exit 1
+fi
+if [ $(hg branch) != "default" ]; then
+    echo "Cannot deploy a non-default branch"
+    exit 1
+fi
+
+echo
+echo "$(tput smso)你现在deploy的revision是$(tput rmso)"
+hg sum
+
+if [ -n "$(hg diff)" ]; then
+    echo
+    echo "$(tput smso)你的以下修改没有commit$(tput rmso)"
+    hg diff
+fi
+
+echo
+echo "$(tput smso)做好测试$(tput rmso)"
+echo -n "$(tput bold)$(tput setaf 3)"
+echo "确认你已经做了必要的测试并且日志文件里没有异常的错误。"
+echo "部署步骤参考 $(tput smul)https://shenzhen.wumii.net/wiki/WebServer#.E9.83.A8.E7.BD.B2$(tput rmul)"
+echo "$(tput setaf 7)"
+read -s -p "继续？(yes/no) " ANS
+echo "$(tput sgr0)"
+if [ "${ANS,,}" != yes ]; then
+    echo "Aborted"
+    exit 1
+fi
+
+PROPERTIES_FILE_NAME=application.properties
+PROPERTIES_FILE=wechat-operation-web/src/main/resources/$PROPERTIES_FILE_NAME
+PORT_PROPERTY=server.port
+SERVERS_PROPERTY=deployment.servers
+SERVICE_NAME_PROPERTY=spring.application.name
+
+function get_property() {
+    propertyName=`echo $1 | sed -e "s/\./\\\./g"`
+    fileName=$2;
+    cat $fileName | sed -n -e "s/^$propertyName=//p"
+}
+
+SERVICE_NAME=`get_property $SERVICE_NAME_PROPERTY $PROPERTIES_FILE`
+SERVICE_PORT=`get_property $PORT_PROPERTY $PROPERTIES_FILE`
+SERVERS=`get_property $SERVERS_PROPERTY $PROPERTIES_FILE|sed "s/,/\n/g"`
+
+# execute a dummy command to record password early
+ssh web-6 true
+
+echo "Writing Mercurial manifest..."
+VERSION_FILE=wechat-operation-web/src/main/resources/version.txt
+hg parents --template '{node}\n\n' > "$VERSION_FILE"
+mvn -U -Dmaven.test.skip=true -P prod clean package
+rm "$VERSION_FILE"
+echo
+
+LOCAL_DIFF=$(hg diff -w)
+if [ -n "$LOCAL_DIFF" ]; then
+    LOCAL_DIFF="Local Changes:
+
+$LOCAL_DIFF"
+fi
+
+CURRENT_REVISION=$(hg tip)
+
+echo "Sending deployment notification"
+exim -i -f "$USER@wumii.com" team@wumii.com <<MAIL
+From: $USER@wumii.com
+To: team@wumii.com
+Subject: [Deployment] $SERVICE_NAME
+Content-Type: text/plain; charset=UTF-8
+$USER is deploying $SERVICE_NAME from $HOSTNAME
+$DESC
+
+$CURRENT_REVISION
+
+$LOCAL_DIFF
+
+MAIL
+echo
+
+function deploy_host() {
+    local HOST=$1
+    echo "<<< Deploying $SERVICE_NAME to $HOST"
+    echo
+    ssh -t $HOST "mkdir -p /tmp/$SERVICE_NAME/"
+    scp -r deploy wechat-operation-web/target/wechat-operation-web-1.0-SNAPSHOT.jar $PROPERTIES_FILE $HOST:/tmp/$SERVICE_NAME/
+    ssh -t $HOST "/tmp/$SERVICE_NAME/deploy /tmp/$SERVICE_NAME/app.jar /tmp/$SERVICE_NAME/$PROPERTIES_FILE_NAME && rm -rf /tmp/$SERVICE_NAME/"
+    echo
+}
+
+for i in $SERVERS; do
+    deploy_host $i
+    echo "Wait 60 seconds to deploy service to the next server..."
+    sleep 60
+    while :
+    do
+        echo "checking service status..."
+        HTTP_CODE=$(curl -m 5 -s -o /dev/null -w "%{http_code}" "http://$i:$SERVICE_PORT/manage/info" || true)
+        if [ "$HTTP_CODE" = 200 ]; then
+            break
+        else
+            echo "$(tput bold)$(tput setaf 3)warning: service status code is $HTTP_CODE, wait for service before deploying to next server, sleep 10s$(tput sgr0)"
+            sleep 10
+        fi
+    done
+done
+
+echo "Deployment succeeded"

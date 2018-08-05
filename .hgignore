@@ -1,0 +1,10 @@
+syntax: regexp
+target/
+.idea
+.iml
+.orig
+.pyc
+log/
+db/
+Lib/
+Scripts/
